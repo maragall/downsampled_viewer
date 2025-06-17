@@ -1,89 +1,171 @@
 #!/usr/bin/env python3
 """
 Memory-efficient grid visualization for ndv.
-Assembles downsampled image tiles into a mosaic view.
+Assembles downsampled image tiles into a seamless mosaic view with MIP across channels.
 """
 
 import re
 import csv
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 import tifffile as tf
 from PIL import Image
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QByteArray, QBuffer, QIODevice
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QComboBox, QLabel, QScrollArea, QMenu, QMessageBox, QFileDialog
+    QLabel, QScrollArea, QMessageBox, QFileDialog
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QAction
-import ndv
+from PyQt6.QtGui import QPixmap, QImage, QAction
 
 # Pattern for manual acquisitions: manual_{fov}_{z}_Fluorescence_{wavelength}_nm_Ex.tiff
 FPATTERN = re.compile(
     r"manual_(?P<f>\d+)_(?P<z>\d+)_Fluorescence_(?P<wavelength>\d+)_nm_Ex\.tiff?", re.IGNORECASE
 )
 
-class TileWidget(QLabel):
-    """Individual tile in the grid."""
-    clicked = pyqtSignal(int, int)  # fov, mouse_button
+class MosaicWidget(QLabel):
+    """Widget displaying seamless mosaic of tiles with coordinate tracking."""
     
-    def __init__(self, fov: int, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.fov = fov
-        self.selected = False
-        self.setScaledContents(True)
-        self.setStyleSheet("border: 2px solid transparent;")
-    
-    def mousePressEvent(self, event):
-        self.clicked.emit(self.fov, event.button())
-    
-    def set_selected(self, selected: bool):
-        self.selected = selected
-        color = "#00ff00" if selected else "transparent"
-        self.setStyleSheet(f"border: 2px solid {color};")
+        self.setMouseTracking(True)
+        self.coordinates = {}  # {fov: (x_mm, y_mm)}
+        self.fov_grid = {}  # {(row, col): fov}
+        self.tile_size = 75  # Reduced from 150 for 4x faster processing
+        self.grid_dims = (0, 0)  # (n_rows, n_cols)
+        
+        # Coordinate mapping parameters
+        self.mm_per_pixel_x = 0.0
+        self.mm_per_pixel_y = 0.0
+        self.origin_mm = (0.0, 0.0)
+        self._mapping_initialized = False
+        
+    def set_grid_data(self, coordinates: Dict[int, Tuple[float, float]], 
+                      fov_grid: Dict[Tuple[int, int], int],
+                      grid_dims: Tuple[int, int]):
+        """Set grid configuration data."""
+        self.coordinates = coordinates
+        self.fov_grid = fov_grid
+        self.grid_dims = grid_dims
+        
+        # Calculate pixel to mm mapping
+        self._calculate_pixel_mapping()
+        
+    def _calculate_pixel_mapping(self):
+        """Pre-calculate pixel position to mm coordinate mapping."""
+        if not self.coordinates:
+            self._mapping_initialized = False
+            return
+            
+        x_coords = [c[0] for c in self.coordinates.values()]
+        y_coords = [c[1] for c in self.coordinates.values()]
+        
+        if not x_coords or not y_coords:
+            self._mapping_initialized = False
+            return
+            
+        x_min, x_max = min(x_coords), max(x_coords)
+        y_min, y_max = min(y_coords), max(y_coords)
+        
+        # Calculate mm per pixel
+        n_rows, n_cols = self.grid_dims
+        
+        # Handle edge case where we have only one row or column
+        if n_cols > 1:
+            mm_per_tile_x = (x_max - x_min) / (n_cols - 1)
+        else:
+            mm_per_tile_x = 1.0  # Default value for single column
+            
+        if n_rows > 1:
+            mm_per_tile_y = (y_max - y_min) / (n_rows - 1)
+        else:
+            mm_per_tile_y = 1.0  # Default value for single row
+            
+        self.mm_per_pixel_x = mm_per_tile_x / self.tile_size
+        self.mm_per_pixel_y = mm_per_tile_y / self.tile_size
+        self.origin_mm = (x_min, y_min)
+        self._mapping_initialized = True
+        
+    def mouseMoveEvent(self, event):
+        """Track mouse position and display coordinates."""
+        if not self._mapping_initialized:
+            return
+            
+        pos = event.position().toPoint()
+        
+        # Calculate mm coordinates from pixel position
+        x_mm = self.origin_mm[0] + pos.x() * self.mm_per_pixel_x
+        y_mm = self.origin_mm[1] + pos.y() * self.mm_per_pixel_y
+        
+        # Find which FOV we're over
+        col = pos.x() // self.tile_size
+        row = pos.y() // self.tile_size
+        fov = self.fov_grid.get((row, col), -1)
+        
+        # Update status bar in parent
+        parent = self.parent()
+        while parent and not isinstance(parent, QMainWindow):
+            parent = parent.parent()
+            
+        if parent and hasattr(parent, 'statusBar'):
+            if fov >= 0:
+                parent.statusBar().showMessage(
+                    f"Position: ({x_mm:.3f}, {y_mm:.3f}) mm | "
+                    f"Pixel: ({pos.x()}, {pos.y()}) | FOV: {fov}"
+                )
+            else:
+                parent.statusBar().showMessage(
+                    f"Position: ({x_mm:.3f}, {y_mm:.3f}) mm | "
+                    f"Pixel: ({pos.x()}, {pos.y()})"
+                )
 
 class GridViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NDV Grid Viewer")
-        self.resize(1200, 800)
+        self.setWindowTitle("NDV Grid Viewer - Fast Preview")
+        self.resize(800, 600)  # Smaller default size for preview
         
         # Data storage
         self.acquisition_dir = None
         self.coordinates = {}  # {fov: (x_mm, y_mm)}
         self.channels = []
-        self.tiles = {}  # {fov: TileWidget}
-        self.selected_fovs = set()
         self.file_map = {}  # {(channel, fov): filepath}
         self.cache_dir = None
         
-        # Viewers for full resolution
-        self._viewers = set()
+        # Grid organization
+        self.fov_grid = {}  # {(row, col): fov}
+        self.grid_dims = (0, 0)  # (n_rows, n_cols)
         
         self._setup_ui()
     
     def _setup_ui(self):
+        """Initialize the user interface."""
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         
-        # Controls
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Channel:"))
-        self.channel_combo = QComboBox()
-        self.channel_combo.currentTextChanged.connect(self._on_channel_changed)
-        controls.addWidget(self.channel_combo)
-        controls.addStretch()
-        layout.addLayout(controls)
+        # Info bar
+        info_layout = QHBoxLayout()
+        self.info_label = QLabel("No acquisition loaded")
+        info_layout.addWidget(self.info_label)
+        info_layout.addStretch()
         
-        # Grid area
+        # Progress label for loading
+        self.progress_label = QLabel("")
+        info_layout.addWidget(self.progress_label)
+        
+        layout.addLayout(info_layout)
+        
+        # Mosaic area
         self.scroll = QScrollArea()
-        self.grid_widget = QWidget()
-        self.scroll.setWidget(self.grid_widget)
+        self.mosaic_widget = MosaicWidget()
+        self.scroll.setWidget(self.mosaic_widget)
         self.scroll.setWidgetResizable(True)
         layout.addWidget(self.scroll)
+        
+        # Status bar for coordinates
+        self.statusBar().showMessage("Ready - Open an acquisition to begin")
         
         # Menu bar
         menubar = self.menuBar()
@@ -91,339 +173,397 @@ class GridViewer(QMainWindow):
         open_action = QAction("Open Acquisition", self)
         open_action.triggered.connect(self._open_acquisition)
         file_menu.addAction(open_action)
+        
+        # Add separator
+        file_menu.addSeparator()
+        
+        # Add quit action
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
     
     def _open_acquisition(self):
-        print("[LOG] _open_acquisition called")
+        """Open acquisition directory dialog."""
+        print("[LOG] Opening acquisition directory dialog")
         dir_path = QFileDialog.getExistingDirectory(self, "Select Acquisition Directory")
-        print(f"[LOG] Selected directory: {dir_path}")
+        
         if not dir_path:
-            print("[LOG] No directory selected.")
+            print("[LOG] No directory selected")
             return
         
+        print(f"[LOG] Selected directory: {dir_path}")
         self.acquisition_dir = Path(dir_path)
         self._load_acquisition()
     
     def _load_acquisition(self):
-        print(f"[LOG] _load_acquisition called for {self.acquisition_dir}")
-        # Find timepoint directories (e.g., "0", "1", etc.)
-        timepoint_dirs = [d for d in self.acquisition_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-        print(f"[LOG] Found timepoint directories: {[str(d) for d in timepoint_dirs]}")
+        """Load acquisition data from directory."""
+        print(f"[LOG] Loading acquisition from {self.acquisition_dir}")
+        
+        # Find timepoint directories
+        timepoint_dirs = []
+        for item in self.acquisition_dir.iterdir():
+            if item.is_dir() and item.name.isdigit():
+                timepoint_dirs.append(item)
+        
+        print(f"[LOG] Found {len(timepoint_dirs)} timepoint directories")
         
         if not timepoint_dirs:
-            print("[LOG] No timepoint directories found.")
             QMessageBox.warning(self, "Error", "No timepoint directories found")
             return
         
-        # Use first timepoint for now
-        timepoint_dir = sorted(timepoint_dirs)[0]
+        # Use first timepoint
+        timepoint_dir = sorted(timepoint_dirs, key=lambda x: int(x.name))[0]
         print(f"[LOG] Using timepoint directory: {timepoint_dir}")
         
-        # Load coordinates from timepoint directory
+        # Load coordinates
         coord_file = timepoint_dir / "coordinates.csv"
-        print(f"[LOG] Looking for coordinates file: {coord_file}")
         if not coord_file.exists():
-            print(f"[LOG] coordinates.csv not found in {timepoint_dir}")
             QMessageBox.warning(self, "Error", f"coordinates.csv not found in {timepoint_dir}")
             return
         
-        self.coordinates.clear()
-        with open(coord_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                fov = int(row['fov'])
-                x_mm = float(row['x (mm)'])
-                y_mm = float(row['y (mm)'])
-                self.coordinates[fov] = (x_mm, y_mm)
-        print(f"[LOG] Loaded coordinates for {len(self.coordinates)} FOVs.")
+        self._load_coordinates(coord_file)
         
         # Setup cache directory
         self.cache_dir = self.acquisition_dir / "cache"
         self.cache_dir.mkdir(exist_ok=True)
-        print(f"[LOG] Cache directory set to: {self.cache_dir}")
+        print(f"[LOG] Cache directory: {self.cache_dir}")
         
-        # Find all TIFF files in the timepoint directory
+        # Scan for TIFF files
         self._scan_files(timepoint_dir)
         
-        # Update UI
-        self.channel_combo.clear()
-        self.channel_combo.addItems(sorted(self.channels))
-        print(f"[LOG] Channels found: {self.channels}")
+        # Update UI and build mosaic
+        self._update_ui_after_load()
+    
+    def _load_coordinates(self, coord_file: Path):
+        """Load FOV coordinates from CSV file."""
+        print(f"[LOG] Loading coordinates from {coord_file}")
+        self.coordinates.clear()
         
-        if self.channels:
-            self._build_grid()
-        else:
-            print("[LOG] No channels found.")
+        try:
+            with open(coord_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    fov = int(row['fov'])
+                    x_mm = float(row['x (mm)'])
+                    y_mm = float(row['y (mm)'])
+                    self.coordinates[fov] = (x_mm, y_mm)
+            
+            print(f"[LOG] Loaded {len(self.coordinates)} FOV coordinates")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to load coordinates: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load coordinates: {e}")
     
     def _scan_files(self, timepoint_dir: Path):
-        """Scan timepoint directory for TIFF files and organize by channel/fov."""
-        print(f"[LOG] _scan_files called for {timepoint_dir}")
+        """Scan directory for TIFF files and organize by channel/FOV."""
+        print(f"[LOG] Scanning {timepoint_dir} for TIFF files")
+        
         self.file_map.clear()
         self.channels = set()
         
-        # Get all TIFF files in this timepoint directory
-        tiff_files = list(timepoint_dir.glob("*.tif*"))
-        print(f"[LOG] Found {len(tiff_files)} TIFF files.")
+        # Find all TIFF files
+        tiff_files = list(timepoint_dir.glob("*.tif")) + list(timepoint_dir.glob("*.tiff"))
+        print(f"[LOG] Found {len(tiff_files)} TIFF files")
         
         for filepath in tiff_files:
-            if m := FPATTERN.search(filepath.name):
-                fov = int(m.group("f"))
-                wavelength = m.group("wavelength")
-                channel = f"{wavelength}nm"  # Create a channel name from wavelength
+            match = FPATTERN.search(filepath.name)
+            if not match:
+                continue
                 
-                if fov in self.coordinates:
-                    self.channels.add(channel)
-                    # For multi-z, we'll select middle layer later
-                    key = (channel, fov)
-                    if key not in self.file_map:
-                        self.file_map[key] = []
-                    self.file_map[key].append(filepath)
-        print(f"[LOG] Channels after scan: {self.channels}")
-        print(f"[LOG] File map keys: {list(self.file_map.keys())}")
-        self.channels = list(self.channels)
+            fov = int(match.group("f"))
+            wavelength = match.group("wavelength")
+            channel = f"{wavelength}nm"
+            
+            # Only include FOVs that have coordinates
+            if fov not in self.coordinates:
+                continue
+                
+            self.channels.add(channel)
+            key = (channel, fov)
+            
+            if key not in self.file_map:
+                self.file_map[key] = []
+            self.file_map[key].append(filepath)
+        
+        self.channels = sorted(list(self.channels))
+        print(f"[LOG] Found channels: {self.channels}")
+        print(f"[LOG] Mapped {len(self.file_map)} channel-FOV combinations")
+    
+    def _update_ui_after_load(self):
+        """Update UI elements after loading acquisition."""
+        if self.channels and self.coordinates:
+            self.info_label.setText(
+                f"Loaded: {len(self.coordinates)} FOVs, {len(self.channels)} channels | "
+                f"Computing MIP across channels..."
+            )
+            
+            # Build grid structure
+            self._build_grid()
+            
+            # Create MIP mosaic
+            self._create_mip_mosaic()
+        else:
+            self.info_label.setText("No valid data found")
+    
+    def _build_grid(self):
+        """Build grid structure from coordinates."""
+        print("[LOG] Building grid structure")
+        
+        if not self.coordinates:
+            return
+        
+        # Get coordinate bounds and unique positions
+        x_positions = sorted(set(c[0] for c in self.coordinates.values()))
+        y_positions = sorted(set(c[1] for c in self.coordinates.values()))
+        
+        n_cols = len(x_positions)
+        n_rows = len(y_positions)
+        
+        print(f"[LOG] Grid dimensions: {n_rows} rows x {n_cols} cols")
+        
+        # Create position to index mappings with tolerance
+        x_to_col = {}
+        y_to_row = {}
+        
+        tolerance = 0.001  # 1 micron tolerance
+        
+        for i, x in enumerate(x_positions):
+            x_to_col[x] = i
+            
+        for i, y in enumerate(y_positions):
+            y_to_row[y] = i
+        
+        # Build FOV grid
+        self.fov_grid.clear()
+        
+        for fov, (x_mm, y_mm) in self.coordinates.items():
+            # Find closest x position
+            col = None
+            for x_pos, idx in x_to_col.items():
+                if abs(x_pos - x_mm) < tolerance:
+                    col = idx
+                    break
+                    
+            # Find closest y position
+            row = None
+            for y_pos, idx in y_to_row.items():
+                if abs(y_pos - y_mm) < tolerance:
+                    row = idx
+                    break
+                    
+            if col is not None and row is not None:
+                self.fov_grid[(row, col)] = fov
+            else:
+                print(f"[WARNING] Could not place FOV {fov} at ({x_mm}, {y_mm})")
+        
+        self.grid_dims = (n_rows, n_cols)
+        
+        # Update mosaic widget
+        self.mosaic_widget.set_grid_data(self.coordinates, self.fov_grid, self.grid_dims)
+        
+        # Set widget size
+        width = n_cols * self.mosaic_widget.tile_size
+        height = n_rows * self.mosaic_widget.tile_size
+        self.mosaic_widget.setFixedSize(width, height)
+        
+        print(f"[LOG] Grid built with {len(self.fov_grid)} tiles")
     
     def _get_middle_z_file(self, files: List[Path]) -> Path:
         """Select middle z-layer from list of files."""
         if len(files) == 1:
             return files[0]
         
-        # Parse z indices
+        # Sort files by z-index
         z_files = []
         for f in files:
-            if m := FPATTERN.search(f.name):
-                z = int(m.group("z"))
+            match = FPATTERN.search(f.name)
+            if match:
+                z = int(match.group("z"))
                 z_files.append((z, f))
         
-        z_files.sort()
+        if not z_files:
+            return files[0]  # Fallback
+            
+        z_files.sort(key=lambda x: x[0])
         mid_idx = len(z_files) // 2
+        
         return z_files[mid_idx][1]
     
-    def _build_grid(self):
-        print("[LOG] _build_grid called")
-        # Clear existing
-        if self.grid_widget.layout():
-            QWidget().setLayout(self.grid_widget.layout())
+    def _create_mip_mosaic(self):
+        """Create MIP mosaic across all channels."""
+        print("[LOG] Creating MIP mosaic across channels")
         
-        self.tiles.clear()
-        self.selected_fovs.clear()
+        n_rows, n_cols = self.grid_dims
+        tile_size = self.mosaic_widget.tile_size
         
-        # Calculate grid bounds
-        x_coords = [c[0] for c in self.coordinates.values()]
-        y_coords = [c[1] for c in self.coordinates.values()]
-        x_min, x_max = min(x_coords), max(x_coords)
-        y_min, y_max = min(y_coords), max(y_coords)
+        # Create blank mosaic
+        mosaic_img = Image.new('L', (n_cols * tile_size, n_rows * tile_size), 0)
         
-        # Estimate grid size (assuming regular spacing)
-        n_cols = len(set(x_coords))
-        n_rows = len(set(y_coords))
-        print(f"[LOG] Grid size: {n_rows} rows x {n_cols} cols")
+        total_tiles = len(self.fov_grid)
+        processed_tiles = 0
         
-        # Create grid layout manually
-        grid_layout = QVBoxLayout()
-        self.grid_widget.setLayout(grid_layout)
-        
-        # Group FOVs by approximate row/column
-        x_step = (x_max - x_min) / (n_cols - 1) if n_cols > 1 else 1
-        y_step = (y_max - y_min) / (n_rows - 1) if n_rows > 1 else 1
-        
-        grid = {}  # {(row, col): fov}
-        for fov, (x, y) in self.coordinates.items():
-            col = round((x - x_min) / x_step) if x_step > 0 else 0
-            row = round((y - y_min) / y_step) if y_step > 0 else 0
-            grid[(row, col)] = fov
-        
-        # Build grid
-        for row in range(n_rows):
-            row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setSpacing(2)
+        # Process each FOV position
+        for (row, col), fov in self.fov_grid.items():
+            # Update progress
+            processed_tiles += 1
+            self.progress_label.setText(f"Processing tile {processed_tiles}/{total_tiles}")
+            QApplication.processEvents()  # Update UI
             
-            for col in range(n_cols):
-                if (row, col) in grid:
-                    fov = grid[(row, col)]
-                    tile = TileWidget(fov)
-                    tile.clicked.connect(self._on_tile_clicked)
-                    tile.setFixedSize(150, 150)  # Thumbnail size
-                    self.tiles[fov] = tile
-                    row_layout.addWidget(tile)
-                else:
-                    # Empty space
-                    spacer = QLabel()
-                    spacer.setFixedSize(150, 150)
-                    row_layout.addWidget(spacer)
+            # Check if we have a cached MIP for this FOV
+            mip_cache_path = self.cache_dir / f"mip_fov_{fov}_thumb.jpg"
             
-            row_layout.addStretch()
-            grid_layout.addWidget(row_widget)
-        
-        grid_layout.addStretch()
-        print(f"[LOG] Built grid with {len(self.tiles)} tiles.")
-        
-        # Load thumbnails for current channel
-        if self.channel_combo.currentText():
-            self._load_channel_thumbnails()
-    
-    def _load_channel_thumbnails(self):
-        print("[LOG] _load_channel_thumbnails called")
-        channel = self.channel_combo.currentText()
-        print(f"[LOG] Current channel: {channel}")
-        if not channel:
-            print("[LOG] No channel selected.")
-            return
-        
-        for fov, tile in self.tiles.items():
-            cache_path = self.cache_dir / f"channel_{channel}_fov_{fov}_thumb.jpg"
-            print(f"[LOG] Loading thumbnail for FOV {fov} at {cache_path}")
-            
-            if cache_path.exists():
-                # Load from cache
-                pixmap = QPixmap(str(cache_path))
-                tile.setPixmap(pixmap)
+            if mip_cache_path.exists():
+                # Load cached MIP
+                tile_img = Image.open(mip_cache_path)
+                tile_img = tile_img.convert('L')
             else:
-                # Generate thumbnail
-                key = (channel, fov)
-                if key in self.file_map:
-                    file_path = self._get_middle_z_file(self.file_map[key])
-                    self._generate_thumbnail(file_path, cache_path, tile)
+                # Generate MIP from all channels
+                tile_img = self._generate_fov_mip(fov, mip_cache_path)
+                
+                if tile_img is None:
+                    continue
+            
+            # Ensure correct size
+            if tile_img.size != (tile_size, tile_size):
+                tile_img = tile_img.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+            
+            # Paste into mosaic
+            x = col * tile_size
+            y = row * tile_size
+            mosaic_img.paste(tile_img, (x, y))
+        
+        # Clear progress
+        self.progress_label.setText("")
+        
+        # Update info label
+        self.info_label.setText(
+            f"Fast Preview: {len(self.coordinates)} FOVs, {len(self.channels)} channels"
+        )
+        
+        # Display the mosaic
+        self._display_mosaic(mosaic_img)
+        
+        print(f"[LOG] MIP mosaic created successfully")
     
-    def _generate_thumbnail(self, tiff_path: Path, cache_path: Path, tile: TileWidget):
-        """Generate and cache thumbnail."""
+    def _generate_fov_mip(self, fov: int, cache_path: Path) -> Optional[Image.Image]:
+        """Generate fast composite image by selecting channel with highest mean intensity."""
+        best_channel = None
+        best_mean = -1
+        best_image = None
+        
+        # Quick scan: find channel with highest mean intensity
+        for channel in self.channels:
+            key = (channel, fov)
+            if key not in self.file_map:
+                continue
+                
+            # Get middle z file
+            file_path = self._get_middle_z_file(self.file_map[key])
+            
+            try:
+                # Read image with memmap for speed (doesn't load full image into memory)
+                img_array = tf.imread(file_path, aszarr=True)
+                
+                # Quick downsample for mean calculation (every 10th pixel)
+                downsampled = img_array[::10, ::10]
+                mean_intensity = np.mean(downsampled)
+                
+                if mean_intensity > best_mean:
+                    best_mean = mean_intensity
+                    best_channel = channel
+                    # Now actually load the best one
+                    best_image = tf.imread(file_path)
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to load {channel} for FOV {fov}: {e}")
+                continue
+        
+        if best_image is None:
+            print(f"[WARNING] No channel data for FOV {fov}")
+            return None
+        
         try:
-            # Read TIFF
-            img = tf.imread(tiff_path)
-            
-            # Convert to 8-bit for display
-            if img.dtype != np.uint8:
-                # Scale to 0-255
-                img_min, img_max = img.min(), img.max()
+            # Fast conversion to 8-bit
+            if best_image.dtype == np.uint16:
+                # Simple bit shift for 16-bit images (much faster than percentiles)
+                img_8bit = (best_image >> 8).astype(np.uint8)
+            elif best_image.dtype != np.uint8:
+                # Quick normalize for other types
+                img_min, img_max = best_image.min(), best_image.max()
                 if img_max > img_min:
-                    img = ((img - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+                    img_8bit = ((best_image - img_min) / (img_max - img_min) * 255).astype(np.uint8)
                 else:
-                    img = np.zeros_like(img, dtype=np.uint8)
+                    img_8bit = np.zeros_like(best_image, dtype=np.uint8)
+            else:
+                img_8bit = best_image
             
-            # Create PIL image and resize
-            pil_img = Image.fromarray(img)
-            pil_img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+            # Create PIL image
+            pil_img = Image.fromarray(img_8bit)
             
-            # Save to cache
-            pil_img.save(cache_path, "JPEG", quality=85)
+            # Fast thumbnail with NEAREST for speed
+            pil_img.thumbnail((self.mosaic_widget.tile_size, self.mosaic_widget.tile_size), 
+                            Image.Resampling.NEAREST)
+            
+            # Save to cache with lower quality for speed
+            pil_img.save(cache_path, "JPEG", quality=75)
+            
+            return pil_img
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to generate composite for FOV {fov}: {e}")
+            return None
+    
+    def _display_mosaic(self, mosaic_img: Image.Image):
+        """Convert PIL Image to QPixmap and display."""
+        try:
+            # Convert to RGB for display
+            if mosaic_img.mode != 'RGB':
+                mosaic_img = mosaic_img.convert('RGB')
+            
+            # Convert PIL Image to QPixmap using QImage
+            img_data = mosaic_img.tobytes('raw', 'RGB')
+            
+            # Create QImage
+            qimage = QImage(img_data, 
+                          mosaic_img.width, 
+                          mosaic_img.height, 
+                          mosaic_img.width * 3,  # bytes per line
+                          QImage.Format.Format_RGB888)
+            
+            # Convert to QPixmap
+            pixmap = QPixmap.fromImage(qimage)
             
             # Display
-            pixmap = QPixmap(str(cache_path))
-            tile.setPixmap(pixmap)
+            self.mosaic_widget.setPixmap(pixmap)
+            
+            print(f"[LOG] Displayed MIP mosaic: {mosaic_img.width}x{mosaic_img.height} pixels")
             
         except Exception as e:
-            print(f"Error generating thumbnail for {tiff_path}: {e}")
-            tile.setText("Error")
-    
-    def _on_channel_changed(self, channel: str):
-        """Handle channel selection change."""
-        if channel and self.tiles:
-            self._load_channel_thumbnails()
-    
-    def _on_tile_clicked(self, fov: int, button: int):
-        """Handle tile click."""
-        tile = self.tiles.get(fov)
-        if not tile:
-            return
-        
-        if button == Qt.MouseButton.LeftButton:
-            # Toggle selection
-            if fov in self.selected_fovs:
-                self.selected_fovs.remove(fov)
-                tile.set_selected(False)
-            else:
-                self.selected_fovs.add(fov)
-                tile.set_selected(True)
-        
-        elif button == Qt.MouseButton.RightButton:
-            # Context menu
-            menu = QMenu(self)
-            
-            view_action = menu.addAction("View Full Resolution")
-            view_action.triggered.connect(lambda: self._view_full_resolution(fov))
-            
-            if len(self.selected_fovs) > 1 and fov in self.selected_fovs:
-                stitch_action = menu.addAction("Stitch Selected")
-                stitch_action.triggered.connect(self._stitch_selected)
-            
-            mip_action = menu.addAction("View MIP")
-            mip_action.triggered.connect(lambda: self._view_mip(fov))
-            
-            menu.exec(tile.mapToGlobal(QPoint(0, 0)))
-    
-    def _view_full_resolution(self, fov: int):
-        """Open full resolution viewer for FOV."""
-        channel = self.channel_combo.currentText()
-        if not channel:
-            return
-        
-        key = (channel, fov)
-        if key not in self.file_map:
-            return
-        
-        # Get all z-layers for this FOV
-        files = sorted(self.file_map[key])
-        
-        try:
-            if len(files) == 1:
-                # Single file
-                array = tf.imread(files[0])
-            else:
-                # Stack of files
-                array = np.stack([tf.imread(f) for f in files])
-            
-            # Create viewer
-            viewer = ndv.imshow(array, name=f"FOV {fov} - Channel {channel}")
-            self._viewers.add(viewer)
-            
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to load full resolution: {e}")
-    
-    def _view_mip(self, fov: int):
-        """View maximum intensity projection."""
-        channel = self.channel_combo.currentText()
-        if not channel:
-            return
-        
-        key = (channel, fov)
-        if key not in self.file_map:
-            return
-        
-        files = sorted(self.file_map[key])
-        
-        try:
-            if len(files) == 1:
-                # Single z-layer, just show it
-                array = tf.imread(files[0])
-            else:
-                # Create MIP
-                stack = np.stack([tf.imread(f) for f in files])
-                array = np.max(stack, axis=0)
-            
-            viewer = ndv.imshow(array, name=f"MIP - FOV {fov} - Channel {channel}")
-            self._viewers.add(viewer)
-            
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to create MIP: {e}")
-    
-    def _stitch_selected(self):
-        """Stitch selected tiles (placeholder for full implementation)."""
-        if len(self.selected_fovs) < 2:
-            return
-        
-        QMessageBox.information(self, "Stitch", 
-            f"Would stitch {len(self.selected_fovs)} selected tiles.\n"
-            "Full stitching implementation needed.")
+            print(f"[ERROR] Failed to display mosaic: {e}")
+            QMessageBox.critical(self, "Display Error", f"Failed to display mosaic: {e}")
 
 def main():
+    """Main entry point."""
     app = QApplication(sys.argv)
+    
+    # Set application metadata
+    app.setApplicationName("NDV Grid Viewer - MIP")
+    app.setOrganizationName("NDV")
+    
+    # Create and show viewer
     viewer = GridViewer()
     viewer.show()
     
-    # If directory provided as argument
+    # Load acquisition if provided as argument
     if len(sys.argv) > 1:
-        viewer.acquisition_dir = Path(sys.argv[1])
-        viewer._load_acquisition()
+        acquisition_path = Path(sys.argv[1])
+        if acquisition_path.exists() and acquisition_path.is_dir():
+            viewer.acquisition_dir = acquisition_path
+            viewer._load_acquisition()
+        else:
+            print(f"[WARNING] Invalid path provided: {sys.argv[1]}")
     
+    # Run application
     sys.exit(app.exec())
 
 if __name__ == "__main__":
