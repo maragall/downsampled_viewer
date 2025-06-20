@@ -19,9 +19,10 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap, QImage, QAction
 
-# Pattern for manual acquisitions: manual_{fov}_{z}_Fluorescence_{wavelength}_nm_Ex.tiff
+# Pattern for acquisitions: {region}_{fov}_{z_layer}_{imaging_modality}_{channel_info}_{suffix}.tiff
+# Examples: C5_0_0_Fluorescence_405_nm_Ex.tiff, D6_2_3_Brightfield_BF_Ex.tiff
 FPATTERN = re.compile(
-    r"manual_(?P<f>\d+)_(?P<z>\d+)_Fluorescence_(?P<wavelength>\d+)_nm_Ex\.tiff?", re.IGNORECASE
+    r"(?P<region>[^_]+)_(?P<fov>\d+)_(?P<z>\d+)_(?P<modality>[^_]+)_(?P<channel>[^_]+)_.*\.tiff?", re.IGNORECASE
 )
 
 class MosaicWidget(QLabel):
@@ -268,14 +269,26 @@ class GridViewer(QMainWindow):
         for filepath in tiff_files:
             match = FPATTERN.search(filepath.name)
             if not match:
+                print(f"[WARNING] File doesn't match pattern: {filepath.name}")
                 continue
                 
-            fov = int(match.group("f"))
-            wavelength = match.group("wavelength")
-            channel = f"{wavelength}nm"
+            region = match.group("region")
+            fov = int(match.group("fov"))
+            z_layer = int(match.group("z"))
+            modality = match.group("modality")
+            channel_info = match.group("channel")
+            
+            # Create a comprehensive channel identifier
+            if modality.lower() == "fluorescence":
+                # For fluorescence, use the wavelength/channel info
+                channel = f"{channel_info}"
+            else:
+                # For other modalities (brightfield, etc.), use modality + channel
+                channel = f"{modality}_{channel_info}"
             
             # Only include FOVs that have coordinates
             if fov not in self.coordinates:
+                print(f"[WARNING] FOV {fov} not found in coordinates, skipping")
                 continue
                 
             self.channels.add(channel)
@@ -387,7 +400,10 @@ class GridViewer(QMainWindow):
         z_files.sort(key=lambda x: x[0])
         mid_idx = len(z_files) // 2
         
-        return z_files[mid_idx][1]
+        selected_file = z_files[mid_idx][1]
+        print(f"[LOG] Selected z-layer {z_files[mid_idx][0]} from {len(z_files)} layers")
+        
+        return selected_file
     
     def _create_mip_mosaic(self):
         """Create MIP mosaic across all channels."""
@@ -461,8 +477,8 @@ class GridViewer(QMainWindow):
             file_path = self._get_middle_z_file(self.file_map[key])
             
             try:
-                # Read image with memmap for speed (doesn't load full image into memory)
-                img_array = tf.imread(file_path, aszarr=True)
+                # Read image for mean calculation (small sample)
+                img_array = tf.imread(file_path)
                 
                 # Quick downsample for mean calculation (every 10th pixel)
                 downsampled = img_array[::10, ::10]
@@ -471,8 +487,8 @@ class GridViewer(QMainWindow):
                 if mean_intensity > best_mean:
                     best_mean = mean_intensity
                     best_channel = channel
-                    # Now actually load the best one
-                    best_image = tf.imread(file_path)
+                    # Store the best image
+                    best_image = img_array
                 
             except Exception as e:
                 print(f"[ERROR] Failed to load {channel} for FOV {fov}: {e}")
